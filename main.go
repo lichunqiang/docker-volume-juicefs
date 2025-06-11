@@ -3,9 +3,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -16,6 +16,7 @@ import (
 
 	"github.com/docker/go-plugins-helpers/volume"
 	"github.com/sirupsen/logrus"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 const (
@@ -49,7 +50,7 @@ func newJfsDriver(root string) (*jfsDriver, error) {
 		volumes:   map[string]*jfsVolume{},
 	}
 
-	if data, err := ioutil.ReadFile(d.statePath); err != nil {
+	if data, err := os.ReadFile(d.statePath); err != nil {
 		if os.IsNotExist(err) {
 			logrus.WithField("statePath", d.statePath).Debug("no state found")
 		} else {
@@ -70,49 +71,23 @@ func (d *jfsDriver) saveState() {
 		logrus.WithField("statePath", d.statePath).Error(err)
 	}
 
-	if err := ioutil.WriteFile(d.statePath, data, 0600); err != nil {
+	if err := os.WriteFile(d.statePath, data, 0600); err != nil {
 		logrus.WithField("saveState", d.statePath).Error(err)
 	}
 }
 
 func ceMount(v *jfsVolume) error {
 	options := map[string]string{}
-	format := exec.Command(ceCliPath, "format", "--no-update")
+	mount := exec.Command(ceCliPath, "mount")
 	for k, v := range v.Options {
 		if k == "env" {
-			format.Env = append(os.Environ(), strings.Split(v, ",")...)
-			logrus.Debug("modified env: %s", format.Env)
+			mount.Env = append(os.Environ(), strings.Split(v, ",")...)
+			logrus.Debugf("modified env: %v", mount.Env)
 			continue
 		}
 		options[k] = v
 	}
-	formatOptions := []string{
-		"block-size",
-		"compress",
-		"shards",
-		"storage",
-		"bucket",
-		"access-key",
-		"secret-key",
-		"encrypt-rsa-key",
-	}
-	for _, formatOption := range formatOptions {
-		val, ok := options[formatOption]
-		if !ok {
-			continue
-		}
-		format.Args = append(format.Args, fmt.Sprintf("--%s=%s", formatOption, val))
-		delete(options, formatOption)
-	}
-	format.Args = append(format.Args, v.Source, v.Name)
-	logrus.Debug(format)
-	if out, err := format.CombinedOutput(); err != nil {
-		logrus.Errorf("juicefs format error: %s", out)
-		return logError(err.Error())
-	}
 
-	// options left for `juicefs mount`
-	mount := exec.Command(ceCliPath, "mount")
 	mountFlags := []string{
 		"cache-partial-only",
 		"enable-xattr",
@@ -132,10 +107,11 @@ func ceMount(v *jfsVolume) error {
 		mount.Args = append(mount.Args, fmt.Sprintf("--%s=%s", mountOption, val))
 	}
 	mount.Args = append(mount.Args, v.Source, v.Mountpoint)
-	logrus.Debug(mount)
+	logrus.Debugf("mount command: %s", mount.String())
+
 	go func() {
 		output, _ := mount.CombinedOutput()
-		logrus.Debug(string(output))
+		logrus.Infof("mount output: %s", string(output))
 	}()
 
 	touch := exec.Command("touch", v.Mountpoint+"/.juicefs")
@@ -156,7 +132,7 @@ func ceMount(v *jfsVolume) error {
 		logrus.Debugf("Error in attempt %d: %#v", attempt+1, err)
 		time.Sleep(time.Second)
 	}
-	return logError(err.Error())
+	return logError("failed to mount %s: %v", v.Name, err)
 }
 
 func eeMount(v *jfsVolume) error {
@@ -165,7 +141,7 @@ func eeMount(v *jfsVolume) error {
 	for k, v := range v.Options {
 		if k == "env" {
 			auth.Env = append(os.Environ(), strings.Split(v, ",")...)
-			logrus.Debug("modified env: %s", auth.Env)
+			logrus.Debugf("modified env: %v", auth.Env)
 			continue
 		}
 		options[k] = v
@@ -250,7 +226,7 @@ func eeMount(v *jfsVolume) error {
 		logrus.Debugf("Error in attempt %d: %#v", attempt+1, err)
 		time.Sleep(time.Second)
 	}
-	return logError(err.Error())
+	return logError("failed to mount %s: %v", v.Name, err)
 }
 
 func mountVolume(v *jfsVolume) error {
@@ -274,11 +250,15 @@ func mountVolume(v *jfsVolume) error {
 }
 
 func umountVolume(v *jfsVolume) error {
+	// remove .juicefs file
+	_ = os.Remove(v.Mountpoint + "/.juicefs")
 	cmd := exec.Command("umount", v.Mountpoint)
 	logrus.Debug(cmd)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		logrus.Errorf("juicefs umount error: %s", out)
 		return logError(err.Error())
+	} else {
+		logrus.Infof("juicefs umount output: %s", string(out))
 	}
 	return nil
 }
@@ -335,7 +315,7 @@ func (d *jfsDriver) Remove(r *volume.RemoveRequest) error {
 	}
 
 	if v.connections != 0 {
-		return logError("volume %s is in use", r.Name)
+		return logError("volume %s is in use, connections: %d", r.Name, v.connections)
 	}
 
 	if err := os.Remove(v.Mountpoint); err != nil {
@@ -364,14 +344,17 @@ func (d *jfsDriver) Path(r *volume.PathRequest) (*volume.PathResponse, error) {
 func (d *jfsDriver) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
 	logrus.WithField("method", "mount").Debugf("%#v", r)
 
+	d.Lock()
+	defer d.Unlock()
+
 	v, ok := d.volumes[r.Name]
 	if !ok {
 		return &volume.MountResponse{}, logError("volume %s not found", r.Name)
 	}
-
-	err := mountVolume(v)
-	if err != nil {
-		return &volume.MountResponse{}, logError("failed to mount %s: %s", r.Name, err)
+	if v.connections == 0 {
+		if err := mountVolume(v); err != nil {
+			return &volume.MountResponse{}, logError("failed to mount %s: %s", r.Name, err)
+		}
 	}
 
 	v.connections++
@@ -381,16 +364,22 @@ func (d *jfsDriver) Mount(r *volume.MountRequest) (*volume.MountResponse, error)
 func (d *jfsDriver) Unmount(r *volume.UnmountRequest) error {
 	logrus.WithField("method", "umount").Debugf("%#v", r)
 
+	d.Lock()
+	defer d.Unlock()
 	v, ok := d.volumes[r.Name]
 	if !ok {
 		return logError("volume %s not found", r.Name)
 	}
 
-	if err := umountVolume(v); err != nil {
-		return logError("failed to umount %s: %s", r.Name, err)
+	v.connections--
+
+	if v.connections <= 0 {
+		if err := umountVolume(v); err != nil {
+			return logError("failed to umount %s: %s", r.Name, err)
+		}
+		v.connections = 0
 	}
 
-	v.connections--
 	return nil
 }
 
@@ -433,6 +422,25 @@ func logError(format string, args ...interface{}) error {
 }
 
 func main() {
+	rotator := &lumberjack.Logger{
+		Filename:   "/var/log/juicefs.log", // 日志文件路径
+		MaxSize:    2,                      // 每个日志文件最大2MB
+		MaxBackups: 5,                      // 最多保留5个旧日志文件
+		MaxAge:     7,                      // 最多保留7天
+		Compress:   true,                   // 是否压缩旧日志
+	}
+
+	// auto close log file when exit
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-c
+		_ = rotator.Rotate()
+	}()
+	logrus.SetReportCaller(true)
+	logrus.SetOutput(rotator)
+	logrus.SetFormatter(&logrus.JSONFormatter{DisableHTMLEscape: true})
+
 	debug := os.Getenv("DEBUG")
 	if ok, _ := strconv.ParseBool(debug); ok {
 		logrus.SetLevel(logrus.DebugLevel)

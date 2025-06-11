@@ -5,3 +5,4 @@ plugin
 bin
 .vagrant
 .DS_Store
+plugin.tar.gz

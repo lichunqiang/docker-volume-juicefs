@@ -29,7 +29,7 @@
             }
         ]
     },
-    "mount": [
+    "mounts": [
         {
             "destination": "/jfs/state",
             "options": [
@@ -40,6 +40,16 @@
             "settable": [
                 "source"
             ],
+            "type": "bind"
+        },
+        {
+            "name": "ceph-conf",
+            "description": "ceph config, keyring, etc",
+            "options": [
+                "rbind", "ro"
+            ],
+            "source": "/etc/ceph",
+            "destination": "/etc/ceph",
             "type": "bind"
         }
     ],

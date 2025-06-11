@@ -1,16 +1,16 @@
 PLUGIN_NAME = juicedata/juicefs
 PLUGIN_TAG ?= latest
-rootfs: JUICEFS_CE_VERSION ?= $(shell curl -s https://api.github.com/repos/juicedata/juicefs/releases/latest | grep 'tag_name' | cut -d '"' -f 4 | tr -d 'v')
+rootfs: JUICEFS_CE_VERSION ?= 1.2.3
 
-all: clean rootfs create
+all: clean rootfs tar #create
 
 clean:
 	@echo "### rm ./plugin"
-	@rm -rf ./plugin
+	@rm -rf ./plugin && rm -rf ./plugin.tar.gz
 
 rootfs:
 	@echo "### docker build: rootfs image with docker-volume-juicefs"
-	@docker build --build-arg="JUICEFS_CE_VERSION=${JUICEFS_CE_VERSION}" -t ${PLUGIN_NAME}:rootfs .
+	@docker build --build-arg="JUICEFS_CE_VERSION=${JUICEFS_CE_VERSION}" --no-cache -t ${PLUGIN_NAME}:rootfs .
 	@echo "### create rootfs directory in ./plugin/rootfs"
 	@mkdir -p ./plugin/rootfs
 	@docker create --name tmp ${PLUGIN_NAME}:rootfs
@@ -18,6 +18,10 @@ rootfs:
 	@echo "### copy config.json to ./plugin/"
 	@cp config.json ./plugin/
 	@docker rm -vf tmp
+
+tar:
+	@echo "### create tar file"
+	@tar -zcf plugin.tar.gz ./plugin
 
 create:
 	@echo "### remove existing plugin ${PLUGIN_NAME}:${PLUGIN_TAG} if exists"
