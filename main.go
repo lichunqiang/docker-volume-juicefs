@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -319,7 +320,10 @@ func (d *jfsDriver) Remove(r *volume.RemoveRequest) error {
 	}
 
 	if err := os.Remove(v.Mountpoint); err != nil {
-		return logError(err.Error())
+		if !errors.Is(err, os.ErrNotExist) { // mountpoint not exist, it's ok
+			return logError(err.Error())
+		}
+		logrus.Infof("mountpoint %s not exist, it's ok", v.Mountpoint)
 	}
 
 	delete(d.volumes, r.Name)
