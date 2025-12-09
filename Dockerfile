@@ -27,7 +27,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=bind,target=. \
     CC=/usr/bin/musl-gcc \
     go build \
-        -o bin/docker-volume-juicefs \
+        -o /go/bin/docker-volume-juicefs \
         --ldflags '-linkmode external -extldflags "-static"' .
 
 WORKDIR /workspace
@@ -45,7 +45,7 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /run/docker/plugins /jfs/state /jfs/volumes
-COPY --from=builder /docker-volume-juicefs/bin/docker-volume-juicefs /
+COPY --from=builder /go/bin/docker-volume-juicefs /
 COPY --from=builder /tmp/juicefs /usr/bin/
 RUN /usr/bin/juicefs version 
 CMD ["docker-volume-juicefs"]
