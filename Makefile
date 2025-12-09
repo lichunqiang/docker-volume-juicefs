@@ -1,3 +1,4 @@
+VERSION ?= $(shell git describe --tags --always --dirty --match=v* 2> /dev/null || echo "1.0.0")
 PLUGIN_NAME = juicedata/juicefs
 PLUGIN_TAG ?= latest
 rootfs: JUICEFS_CE_VERSION ?= 1.2.3
@@ -21,7 +22,7 @@ rootfs:
 
 tar:
 	@echo "### create tar file"
-	@tar -zcf plugin.tar.gz ./plugin
+	@tar -zcf plugin-${VERSION}.tar.gz ./plugin
 
 create:
 	@echo "### remove existing plugin ${PLUGIN_NAME}:${PLUGIN_TAG} if exists"
