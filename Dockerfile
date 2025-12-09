@@ -6,13 +6,32 @@ ARG JUICEFS_CE_VERSION
 ENV JUICEFS_CE_VERSION=${JUICEFS_CE_VERSION:-"1.2.3"}
 
 WORKDIR /docker-volume-juicefs
-COPY . .
-RUN apt-get update && apt-get install -y curl musl-tools tar gzip librados-dev
 
-RUN CC=/usr/bin/musl-gcc go build -o bin/docker-volume-juicefs --ldflags '-linkmode external -extldflags "-static"' .
+RUN apt-get update && apt-get install --no-install-recommends -y \
+    curl \
+    musl-tools \
+    tar \
+    gzip \
+    librados-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# download dependencies
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=bind,source=go.mod,target=go.mod \
+    go mod download -x
+
+# build docker-volume-juicefs
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=bind,target=. \
+    CC=/usr/bin/musl-gcc \
+    go build \
+        -o bin/docker-volume-juicefs \
+        --ldflags '-linkmode external -extldflags "-static"' .
 
 WORKDIR /workspace
-# ce
+# build ce version with ceph support
 RUN curl -fsSL -o juicefs-ce.tar.gz https://github.com/juicedata/juicefs/archive/refs/tags/v${JUICEFS_CE_VERSION}.tar.gz && \
     tar -zxf juicefs-ce.tar.gz -C /tmp && \
     cd /tmp/juicefs-${JUICEFS_CE_VERSION} && \
@@ -21,7 +40,9 @@ RUN curl -fsSL -o juicefs-ce.tar.gz https://github.com/juicedata/juicefs/archive
 
 FROM python:3.12-slim
 
-RUN apt-get update && apt-get install -y ceph-common && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install --no-install-recommends -y \
+    ceph-common \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /run/docker/plugins /jfs/state /jfs/volumes
 COPY --from=builder /docker-volume-juicefs/bin/docker-volume-juicefs /

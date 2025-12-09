@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,8 +21,7 @@ import (
 
 const (
 	socketAddress = "/run/docker/plugins/jfs.sock"
-	cliPath       = "/usr/bin/juicefs"
-	ceCliPath     = "/bin/juicefs"
+	ceCliPath     = "/usr/bin/juicefs"
 )
 
 type jfsVolume struct {
@@ -110,15 +108,44 @@ func ceMount(v *jfsVolume) error {
 	mount.Args = append(mount.Args, v.Source, v.Mountpoint)
 	logrus.Debugf("mount command: %s", mount.String())
 
+	// Use a channel to capture mount command errors
+	mountErr := make(chan error, 1)
 	go func() {
-		output, _ := mount.CombinedOutput()
-		logrus.Infof("mount output: %s", string(output))
+		output, err := mount.CombinedOutput()
+		if err != nil {
+			logrus.Errorf("mount command failed: %s, error: %v", string(output), err)
+			mountErr <- fmt.Errorf("mount command failed: %s: %v", string(output), err)
+		} else {
+			logrus.Infof("mount output: %s", string(output))
+			mountErr <- nil
+		}
 	}()
+
+	// Check for immediate startup errors (mount command failing to start)
+	select {
+	case err := <-mountErr:
+		if err != nil {
+			return logError("failed to mount %s: %v", v.Name, err)
+		}
+		// If mount command exits immediately without error, verify mountpoint below
+	case <-time.After(100 * time.Millisecond):
+		// Mount command is running (expected for daemon mode), continue to poll mountpoint
+	}
 
 	touch := exec.Command("touch", v.Mountpoint+"/.juicefs")
 	var fileinfo os.FileInfo
 	var err error
 	for attempt := 0; attempt < 10; attempt++ {
+		// Check if mount command has failed
+		select {
+		case err := <-mountErr:
+			if err != nil {
+				return logError("failed to mount %s: %v", v.Name, err)
+			}
+		default:
+			// Mount command still running, continue
+		}
+
 		if fileinfo, err = os.Lstat(v.Mountpoint); err == nil {
 			stat, ok := fileinfo.Sys().(*syscall.Stat_t)
 			if !ok {
@@ -133,99 +160,15 @@ func ceMount(v *jfsVolume) error {
 		logrus.Debugf("Error in attempt %d: %#v", attempt+1, err)
 		time.Sleep(time.Second)
 	}
-	return logError("failed to mount %s: %v", v.Name, err)
-}
 
-func eeMount(v *jfsVolume) error {
-	auth := exec.Command(cliPath, "auth", v.Name)
-	options := map[string]string{}
-	for k, v := range v.Options {
-		if k == "env" {
-			auth.Env = append(os.Environ(), strings.Split(v, ",")...)
-			logrus.Debugf("modified env: %v", auth.Env)
-			continue
+	// Final check for mount command error
+	select {
+	case err := <-mountErr:
+		if err != nil {
+			return logError("failed to mount %s: %v", v.Name, err)
 		}
-		options[k] = v
-	}
-	commonOptions := []string{"subdir"}
-	authOptions := slices.Concat([]string{
-		"token",
-		"accesskey",
-		"accesskey2",
-		"access-key",
-		"access-key2",
-		"bucket",
-		"bucket2",
-		"secretkey",
-		"secretkey2",
-		"secret-key",
-		"secret-key2",
-		"passphrase",
-	}, commonOptions)
-	for _, authOption := range authOptions {
-		val, ok := options[authOption]
-		if !ok {
-			continue
-		}
-		// auth 的参数确实可以是空, 没有flag
-		auth.Args = append(auth.Args, fmt.Sprintf("--%s=%s", authOption, val))
-		if !slices.Contains(commonOptions, authOption) {
-			delete(options, authOption)
-		}
-	}
-	logrus.Debug(auth)
-	if out, err := auth.CombinedOutput(); err != nil {
-		logrus.Errorf("juicefs auth error: %s", out)
-		return logError(err.Error())
-	}
-
-	// options left for `juicefs mount`
-	mount := exec.Command(cliPath, "mount", v.Name, v.Mountpoint)
-	mountFlags := []string{
-		"external",
-		"internal",
-		"gc",
-		"dry",
-		"flip",
-		"no-sync",
-		"allow-other",
-		"allow-root",
-		"enable-xattr",
-	}
-	for _, mountFlag := range mountFlags {
-		_, ok := options[mountFlag]
-		if !ok {
-			continue
-		}
-		mount.Args = append(mount.Args, fmt.Sprintf("--%s", mountFlag))
-		delete(options, mountFlag)
-	}
-	for mountOption, val := range options {
-		mount.Args = append(mount.Args, fmt.Sprintf("--%s=%s", mountOption, val))
-	}
-	logrus.Debug(mount)
-	if out, err := mount.CombinedOutput(); err != nil {
-		logrus.Errorf("juicefs mount error: %s", out)
-		return logError(err.Error())
-	}
-
-	touch := exec.Command("touch", v.Mountpoint+"/.juicefs")
-	var fileinfo os.FileInfo
-	var err error
-	for attempt := 0; attempt < 3; attempt++ {
-		if fileinfo, err = os.Lstat(v.Mountpoint); err == nil {
-			stat, ok := fileinfo.Sys().(*syscall.Stat_t)
-			if !ok {
-				return logError("Not a syscall.Stat_t")
-			}
-			if stat.Ino == 1 {
-				if err = touch.Run(); err == nil {
-					return nil
-				}
-			}
-		}
-		logrus.Debugf("Error in attempt %d: %#v", attempt+1, err)
-		time.Sleep(time.Second)
+	default:
+		// Mount command still running, but mountpoint check failed
 	}
 	return logError("failed to mount %s: %v", v.Name, err)
 }
@@ -244,9 +187,6 @@ func mountVolume(v *jfsVolume) error {
 		return logError("%v already exist and it's not a directory", v.Mountpoint)
 	}
 
-	if !strings.Contains(v.Source, "://") {
-		return eeMount(v)
-	}
 	return ceMount(v)
 }
 
@@ -375,13 +315,13 @@ func (d *jfsDriver) Unmount(r *volume.UnmountRequest) error {
 		return logError("volume %s not found", r.Name)
 	}
 
-	v.connections--
-
-	if v.connections <= 0 {
+	if v.connections <= 1 {
 		if err := umountVolume(v); err != nil {
 			return logError("failed to umount %s: %s", r.Name, err)
 		}
 		v.connections = 0
+	} else {
+		v.connections--
 	}
 
 	return nil
@@ -434,12 +374,14 @@ func main() {
 		Compress:   true,                   // 是否压缩旧日志
 	}
 
-	// auto close log file when exit
+	// handle graceful shutdown
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		<-c
+		sig := <-c
+		logrus.Infof("Received signal %v, shutting down gracefully", sig)
 		_ = rotator.Rotate()
+		os.Exit(0)
 	}()
 	logrus.SetReportCaller(true)
 	logrus.SetOutput(rotator)

@@ -2,3 +2,5 @@
 .github
 scripts
 .travis.yml
+scripts
+*.md
