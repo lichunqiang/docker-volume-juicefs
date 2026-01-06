@@ -106,15 +106,15 @@ func ceMount(v *jfsVolume) error {
 		mount.Args = append(mount.Args, fmt.Sprintf("--%s=%s", mountOption, val))
 	}
 	mount.Args = append(mount.Args, v.Source, v.Mountpoint)
-	logrus.Debugf("mount command: %s", mount.String())
+	logrus.Infof("mount command: %s", mount.String())
 
 	// Use a channel to capture mount command errors
 	mountErr := make(chan error, 1)
 	go func() {
 		output, err := mount.CombinedOutput()
 		if err != nil {
-			logrus.Errorf("mount command failed: %s, error: %v", string(output), err)
-			mountErr <- fmt.Errorf("mount command failed: %s: %v", string(output), err)
+			logrus.WithError(err).Errorf("mount command failed: %s", string(output))
+			mountErr <- err
 		} else {
 			logrus.Infof("mount output: %s", string(output))
 			mountErr <- nil
@@ -125,22 +125,23 @@ func ceMount(v *jfsVolume) error {
 	select {
 	case err := <-mountErr:
 		if err != nil {
-			return logError("failed to mount %s: %v", v.Name, err)
+			logrus.WithError(err).Errorf("failed to mount %s", v.Name)
+			return err
 		}
 		// If mount command exits immediately without error, verify mountpoint below
 	case <-time.After(100 * time.Millisecond):
 		// Mount command is running (expected for daemon mode), continue to poll mountpoint
 	}
 
-	touch := exec.Command("touch", v.Mountpoint+"/.juicefs")
 	var fileinfo os.FileInfo
 	var err error
 	for attempt := 0; attempt < 10; attempt++ {
 		// Check if mount command has failed
 		select {
-		case err := <-mountErr:
+		case err = <-mountErr:
 			if err != nil {
-				return logError("failed to mount %s: %v", v.Name, err)
+				logrus.WithError(err).Errorf("failed to mount %s", v.Name)
+				return err
 			}
 		default:
 			// Mount command still running, continue
@@ -149,42 +150,57 @@ func ceMount(v *jfsVolume) error {
 		if fileinfo, err = os.Lstat(v.Mountpoint); err == nil {
 			stat, ok := fileinfo.Sys().(*syscall.Stat_t)
 			if !ok {
-				return logError("Not a syscall.Stat_t")
+				logrus.Errorf("mountpoint %s state error", v.Mountpoint)
+				return fmt.Errorf("mountpoint %s state error", v.Mountpoint)
 			}
 			if stat.Ino == 1 {
-				if err = touch.Run(); err == nil {
+				// Verify write access by creating a marker file
+				markerFile := v.Mountpoint + "/.juicefs"
+				if fp, createErr := os.Create(markerFile); createErr == nil {
+					_ = fp.Close()
+					logrus.Infof("Successfully mounted and verified %s at %s", v.Name, v.Mountpoint)
 					return nil
+				} else {
+					logrus.WithError(createErr).Warnf("Failed to create marker file on attempt %d", attempt+1)
 				}
+			} else {
+				logrus.Warnf("Mountpoint inode is %d (expected 1) on attempt %d", stat.Ino, attempt+1)
 			}
+		} else {
+			logrus.WithError(err).Warnf("Mountpoint not ready on attempt %d", attempt+1)
 		}
-		logrus.Debugf("Error in attempt %d: %#v", attempt+1, err)
 		time.Sleep(time.Second)
 	}
 
 	// Final check for mount command error
 	select {
-	case err := <-mountErr:
+	case err = <-mountErr:
 		if err != nil {
-			return logError("failed to mount %s: %v", v.Name, err)
+			logrus.WithError(err).Error("mount failed")
+			return err
 		}
 	default:
 		// Mount command still running, but mountpoint check failed
 	}
-	return logError("failed to mount %s: %v", v.Name, err)
+	logrus.Errorf("failed to mount %s: %v", v.Name, err)
+	return fmt.Errorf("failed to mount %s after 10 attempts: %w", v.Name, err)
 }
 
 func mountVolume(v *jfsVolume) error {
 	fi, err := os.Lstat(v.Mountpoint)
 	if os.IsNotExist(err) {
 		if err := os.MkdirAll(v.Mountpoint, 0755); err != nil {
-			return logError(err.Error())
+			logrus.WithError(err).Errorf("failed to create mountpoint %s", v.Mountpoint)
+			return err
 		}
 	} else if err != nil {
-		return logError(err.Error())
+		logrus.WithError(err).Errorf("failed to stat mountpoint %s", v.Mountpoint)
+		return err
 	}
 
 	if fi != nil && !fi.IsDir() {
-		return logError("%v already exist and it's not a directory", v.Mountpoint)
+		logrus.WithField("mountPoint", v.Mountpoint).Errorf("%s already exist and it's not a directory", v.Name)
+		return fmt.Errorf("%v already exist and it's not a directory", v.Mountpoint)
 	}
 
 	return ceMount(v)
@@ -196,8 +212,8 @@ func umountVolume(v *jfsVolume) error {
 	cmd := exec.Command("umount", v.Mountpoint)
 	logrus.Debug(cmd)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		logrus.Errorf("juicefs umount error: %s", out)
-		return logError(err.Error())
+		logrus.WithError(err).Errorf("juicefs umount error: %s", out)
+		return err
 	} else {
 		logrus.Infof("juicefs umount output: %s", string(out))
 	}
@@ -230,7 +246,7 @@ func (d *jfsDriver) Create(r *volume.CreateRequest) error {
 	}
 
 	if v.Name == "" {
-		return logError("'name' option required")
+		return errors.New("'name' option required")
 	}
 	if v.Source == "" {
 		v.Source = v.Name
@@ -252,16 +268,19 @@ func (d *jfsDriver) Remove(r *volume.RemoveRequest) error {
 	v, ok := d.volumes[r.Name]
 
 	if !ok {
-		return logError("volume %s not found", r.Name)
+		logrus.Errorf("volume %s not found", r.Name)
+		return fmt.Errorf("volume %s not found", r.Name)
 	}
 
 	if v.connections != 0 {
-		return logError("volume %s is in use, connections: %d", r.Name, v.connections)
+		logrus.Errorf("volume %s is in use, connections: %d", r.Name, v.connections)
+		return fmt.Errorf("volume %s is in use, connections: %d", r.Name, v.connections)
 	}
 
 	if err := os.Remove(v.Mountpoint); err != nil {
 		if !errors.Is(err, os.ErrNotExist) { // mountpoint not exist, it's ok
-			return logError(err.Error())
+			logrus.WithError(err).Errorf("failed to remove mountpoint %s", v.Mountpoint)
+			return err
 		}
 		logrus.Infof("mountpoint %s not exist, it's ok", v.Mountpoint)
 	}
@@ -279,7 +298,8 @@ func (d *jfsDriver) Path(r *volume.PathRequest) (*volume.PathResponse, error) {
 
 	v, ok := d.volumes[r.Name]
 	if !ok {
-		return &volume.PathResponse{}, logError("volume %s not found", r.Name)
+		logrus.Infof("volume %s not exists", r.Name)
+		return &volume.PathResponse{}, fmt.Errorf("volume %s not exists", r.Name)
 	}
 
 	return &volume.PathResponse{Mountpoint: v.Mountpoint}, nil
@@ -293,11 +313,13 @@ func (d *jfsDriver) Mount(r *volume.MountRequest) (*volume.MountResponse, error)
 
 	v, ok := d.volumes[r.Name]
 	if !ok {
-		return &volume.MountResponse{}, logError("volume %s not found", r.Name)
+		logrus.Infof("volume %s not exists", r.Name)
+		return &volume.MountResponse{}, fmt.Errorf("volume %s not found", r.Name)
 	}
 	if v.connections == 0 {
 		if err := mountVolume(v); err != nil {
-			return &volume.MountResponse{}, logError("failed to mount %s: %s", r.Name, err)
+			logrus.WithError(err).Errorf("failed to mount %s", r.Name)
+			return &volume.MountResponse{}, err
 		}
 	}
 
@@ -312,12 +334,14 @@ func (d *jfsDriver) Unmount(r *volume.UnmountRequest) error {
 	defer d.Unlock()
 	v, ok := d.volumes[r.Name]
 	if !ok {
-		return logError("volume %s not found", r.Name)
+		logrus.Errorf("volume %s not found", r.Name)
+		return fmt.Errorf("volume %s not found", r.Name)
 	}
 
 	if v.connections <= 1 {
 		if err := umountVolume(v); err != nil {
-			return logError("failed to umount %s: %s", r.Name, err)
+			logrus.WithError(err).Errorf("failed to umount %s", r.Name)
+			return err
 		}
 		v.connections = 0
 	} else {
@@ -335,10 +359,17 @@ func (d *jfsDriver) Get(r *volume.GetRequest) (*volume.GetResponse, error) {
 
 	v, ok := d.volumes[r.Name]
 	if !ok {
-		return &volume.GetResponse{}, logError("volume %s not found", r.Name)
+		logrus.Infof("volume %s not exists", r.Name)
+		return &volume.GetResponse{}, fmt.Errorf("volume %s not exists", r.Name)
 	}
 
-	return &volume.GetResponse{Volume: &volume.Volume{Name: r.Name, Mountpoint: v.Mountpoint}}, nil
+	return &volume.GetResponse{Volume: &volume.Volume{
+		Name:       r.Name,
+		Mountpoint: v.Mountpoint,
+		Status: map[string]interface{}{
+			"connections": v.connections,
+		},
+	}}, nil
 }
 
 func (d *jfsDriver) List() (*volume.ListResponse, error) {
@@ -349,7 +380,12 @@ func (d *jfsDriver) List() (*volume.ListResponse, error) {
 
 	var vols []*volume.Volume
 	for name, v := range d.volumes {
-		vols = append(vols, &volume.Volume{Name: name, Mountpoint: v.Mountpoint})
+		vols = append(vols, &volume.Volume{
+			Name:       name,
+			Mountpoint: v.Mountpoint,
+			Status: map[string]interface{}{
+				"connections": v.connections,
+			}})
 	}
 	return &volume.ListResponse{Volumes: vols}, nil
 }
@@ -358,11 +394,6 @@ func (d *jfsDriver) Capabilities() *volume.CapabilitiesResponse {
 	logrus.WithField("method", "capabilities").Debugf("")
 
 	return &volume.CapabilitiesResponse{Capabilities: volume.Capability{Scope: "local"}}
-}
-
-func logError(format string, args ...interface{}) error {
-	logrus.Errorf(format, args...)
-	return fmt.Errorf(format, args...)
 }
 
 func main() {
@@ -374,15 +405,6 @@ func main() {
 		Compress:   true,                   // 是否压缩旧日志
 	}
 
-	// handle graceful shutdown
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		sig := <-c
-		logrus.Infof("Received signal %v, shutting down gracefully", sig)
-		_ = rotator.Rotate()
-		os.Exit(0)
-	}()
 	logrus.SetReportCaller(true)
 	logrus.SetOutput(rotator)
 	logrus.SetFormatter(&logrus.JSONFormatter{DisableHTMLEscape: true})
@@ -396,6 +418,36 @@ func main() {
 	if err != nil {
 		logrus.Fatal(err)
 	}
+
+	// handle graceful shutdown
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-c
+		logrus.Infof("Received signal %v, initiating graceful shutdown", sig)
+
+		// Save driver state
+		logrus.Info("Saving driver state...")
+		d.saveState()
+
+		// Log active volumes
+		d.RLock()
+		if len(d.volumes) > 0 {
+			logrus.Warnf("Shutting down with %d active volumes still mounted", len(d.volumes))
+			for name, vol := range d.volumes {
+				logrus.Warnf("  Volume %s: mountpoint=%s, connections=%d", name, vol.Mountpoint, vol.connections)
+			}
+		}
+		d.RUnlock()
+
+		// Rotate logs
+		logrus.Info("Rotating logs...")
+		_ = rotator.Rotate()
+
+		logrus.Info("Shutdown complete")
+		os.Exit(0)
+	}()
+
 	h := volume.NewHandler(d)
 	logrus.Infof("listening on %s", socketAddress)
 	logrus.Error(h.ServeUnix(socketAddress, 0))
